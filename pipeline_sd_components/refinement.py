@@ -1051,6 +1051,128 @@ def _cv2_cleanup_dark_tail_blob(
     out = fill.astype(np.float32) * alpha + img_rgb.astype(np.float32) * (1.0 - alpha)
     return np.clip(out, 0, 255).astype(np.uint8)
 
+
+def _build_no_bangs_hairline_halo_mask(
+    composited_rgb: np.ndarray,
+    generated_rgb: np.ndarray,
+    composite_mask: np.ndarray,
+    no_bangs_seed_mask: Optional[np.ndarray],
+    release_mask: Optional[np.ndarray],
+    protect_mask: Optional[np.ndarray],
+    face_bbox: Tuple[int, int, int, int],
+    hair_length: str = "short",
+    subject_gender: str = "unknown",
+) -> np.ndarray:
+    """
+    Build a thin repair mask for the bright fringe left between protected face
+    pixels and generated short hair in no-bangs composites.
+    """
+    H, W = composited_rgb.shape[:2]
+    if generated_rgb.shape[:2] != (H, W) or composite_mask.shape != (H, W):
+        return np.zeros((H, W), dtype=np.float32)
+
+    seed = np.zeros((H, W), dtype=np.float32)
+    if no_bangs_seed_mask is not None and no_bangs_seed_mask.shape == (H, W):
+        seed = np.maximum(
+            seed,
+            np.clip(no_bangs_seed_mask.astype(np.float32), 0.0, 1.0),
+        )
+    if release_mask is not None and release_mask.shape == (H, W):
+        seed = np.maximum(seed, np.clip(release_mask.astype(np.float32), 0.0, 1.0))
+    if float(seed.sum()) <= 8.0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    x1, y1, x2, y2 = [int(v) for v in face_bbox]
+    face_w = max(x2 - x1, 1)
+    face_h = max(y2 - y1, 1)
+    forehead_u8 = np.zeros((H, W), dtype=np.uint8)
+    top = max(0, int(y1 - face_h * 0.18))
+    bottom_ratio = (
+        0.38
+        if hair_length == "short" and subject_gender == "female"
+        else 0.34 if hair_length == "short" else 0.30
+    )
+    bottom = min(H, int(y1 + face_h * bottom_ratio))
+    left = max(0, int(x1 - face_w * 0.34))
+    right = min(W, int(x2 + face_w * 0.34))
+    if top >= bottom or left >= right:
+        return np.zeros((H, W), dtype=np.float32)
+    forehead_u8[top:bottom, left:right] = 255
+
+    hair_core_u8 = (
+        np.clip(composite_mask.astype(np.float32), 0.0, 1.0) > 0.08
+    ).astype(np.uint8) * 255
+    if int((hair_core_u8 > 0).sum()) < 60:
+        return np.zeros((H, W), dtype=np.float32)
+
+    outer = cv2.dilate(
+        hair_core_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+        iterations=1,
+    )
+    inner = cv2.erode(
+        hair_core_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    hair_boundary_u8 = cv2.subtract(outer, inner)
+
+    seed_u8 = cv2.dilate(
+        (seed > 0.03).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1,
+    )
+    candidate_u8 = cv2.bitwise_and(hair_boundary_u8, seed_u8)
+    candidate_u8 = cv2.bitwise_and(candidate_u8, forehead_u8)
+    if protect_mask is not None and protect_mask.shape == (H, W):
+        protect_u8 = cv2.dilate(
+            (np.clip(protect_mask.astype(np.float32), 0.0, 1.0) > 0.03).astype(
+                np.uint8
+            )
+            * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+        candidate_u8 = cv2.bitwise_and(candidate_u8, protect_u8)
+
+    if int((candidate_u8 > 0).sum()) < 12:
+        return np.zeros((H, W), dtype=np.float32)
+
+    comp_gray = cv2.cvtColor(composited_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gen_gray = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    comp_sat = cv2.cvtColor(composited_rgb, cv2.COLOR_RGB2HSV)[:, :, 1].astype(
+        np.float32
+    )
+    bright_halo = (
+        ((comp_gray > 212.0) & (comp_sat < 86.0))
+        | ((comp_gray > 188.0) & ((comp_gray - gen_gray) > 14.0) & (comp_sat < 112.0))
+    )
+    candidate_u8 = cv2.bitwise_and(
+        candidate_u8,
+        bright_halo.astype(np.uint8) * 255,
+    )
+    if int((candidate_u8 > 0).sum()) < 8:
+        return np.zeros((H, W), dtype=np.float32)
+
+    candidate_u8 = cv2.morphologyEx(
+        candidate_u8,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    candidate_u8 = cv2.dilate(
+        candidate_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    mask = cv2.GaussianBlur(
+        candidate_u8.astype(np.float32) / 255.0,
+        (0, 0),
+        sigmaX=1.15,
+        sigmaY=1.25,
+    )
+    return np.clip(mask * 0.84, 0.0, 0.84).astype(np.float32)
+
+
 def _remove_residual_hair_below_cutoff(
     self,
     img_rgb: np.ndarray,
@@ -1591,6 +1713,9 @@ def bind_refinement_methods_to_pipeline(cls) -> None:
     cls._filter_short_torso_box_mask = _filter_short_torso_box_mask
     cls._restrict_short_removal_to_tail_lanes = _restrict_short_removal_to_tail_lanes
     cls._cv2_cleanup_dark_tail_blob = staticmethod(_cv2_cleanup_dark_tail_blob)
+    cls._build_no_bangs_hairline_halo_mask = staticmethod(
+        _build_no_bangs_hairline_halo_mask
+    )
     cls._remove_residual_hair_below_cutoff = _remove_residual_hair_below_cutoff
     cls._final_cutoff_cleanup = _final_cutoff_cleanup
     cls._composite = _composite

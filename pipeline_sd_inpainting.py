@@ -1108,8 +1108,13 @@ class MirrAISDPipeline:
                 _face_h = max(int(_y2 - _y1), 1)
                 _forehead_top = max(0, int(_y1 - _face_h * 0.16))
                 # 남성 no-bangs: 짧게 치고 올리는 스타일 → 이마 아래까지 적극 제거 (0.50)
-                # 여성 no-bangs: 가르마/자연스럽게 넘기는 스타일 → 이마 상단만 보수적 제거 (0.32)
-                _forehead_ratio = 0.50 if subject_gender_mode == "male" else 0.32
+                # 여성 no-bangs: 가르마/자연스럽게 넘기는 스타일. short는
+                # 원본 앞머리 경계 halo가 남지 않도록 hairline seed를 조금 더 포함한다.
+                _forehead_ratio = (
+                    0.50
+                    if subject_gender_mode == "male"
+                    else 0.38 if hair_length == "short" else 0.32
+                )
                 _forehead_bottom = min(H, int(_y1 + _face_h * _forehead_ratio))
                 _forehead_band = np.zeros((H, W), dtype=np.float32)
                 _forehead_band[_forehead_top:_forehead_bottom, :] = 1.0
@@ -5474,6 +5479,53 @@ class MirrAISDPipeline:
                         )
                 except Exception:
                     pass
+            if (
+                hair_length == "short"
+                and subject_gender_mode == "female"
+                and not bangs_requested
+                and (short_no_bangs_target or explicit_no_bangs_requested)
+                and isinstance(generated_resized_rgb, np.ndarray)
+                and generated_resized_rgb.shape[:2] == (H, W)
+            ):
+                try:
+                    comp_rgb_for_halo = cv2.cvtColor(composited_bgr, cv2.COLOR_BGR2RGB)
+                    halo_mask = self._build_no_bangs_hairline_halo_mask(
+                        comp_rgb_for_halo,
+                        generated_resized_rgb,
+                        composite_mask.astype(np.float32),
+                        no_bangs_forehead_lama_preclean_mask,
+                        composite_bangs_release_mask,
+                        protect_mask_for_sd,
+                        face_bbox,
+                        hair_length=hair_length,
+                        subject_gender=subject_gender_mode,
+                    )
+                    if float(halo_mask.sum()) > 8.0:
+                        halo_alpha = halo_mask[..., np.newaxis]
+                        repaired_rgb = (
+                            generated_resized_rgb.astype(np.float32) * halo_alpha
+                            + comp_rgb_for_halo.astype(np.float32) * (1.0 - halo_alpha)
+                        )
+                        composited_bgr = cv2.cvtColor(
+                            np.clip(repaired_rgb, 0, 255).astype(np.uint8),
+                            cv2.COLOR_RGB2BGR,
+                        )
+                        if debug_images_common is not None and gen_idx == 0:
+                            debug_images_common[
+                                "pipeline_no_bangs_hairline_halo_repair_mask"
+                            ] = cv2.cvtColor(
+                                (np.clip(halo_mask, 0.0, 1.0) * 255).astype(np.uint8),
+                                cv2.COLOR_GRAY2BGR,
+                            )
+                        if debug_data_common is not None and gen_idx == 0:
+                            debug_data_common.setdefault("diagnostics", {})[
+                                "no_bangs_hairline_halo_repair_px"
+                            ] = int((halo_mask > 0.04).sum())
+                except Exception as e:
+                    logger.warning(
+                        "[SDPipeline] no-bangs hairline halo repair failed (ignored): %s",
+                        e,
+                    )
             composite_pre_cleanup_bgr = composited_bgr.copy()
             candidate_cleanup_trace: List[Dict[str, Any]] = []
             candidate_prev_rgb = cv2.cvtColor(
